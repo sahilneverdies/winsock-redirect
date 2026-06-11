@@ -309,7 +309,12 @@ static void PatchRecvBuffer(unsigned char* data, int len) {
 
     // ── Phase 2: Patch string fields with workshop_code / room identifiers ──
     // Scan for string field tags (wire type 2) and modify known patterns
-    int workshop_field_tags[] = { 0x22, 0x2A, 0x32, 0x3A, 0x42, 0x4A, 0x52, 0x5A };
+    int workshop_field_tags[] = {
+        0x0A, 0x12, 0x1A,           // fields 1-3
+        0x22, 0x2A, 0x32, 0x3A,     // fields 4-7
+        0x42, 0x4A, 0x52, 0x5A,     // fields 8-11
+        0x62, 0x6A, 0x72, 0x7A      // fields 12-15
+    };
     int num_tags = sizeof(workshop_field_tags) / sizeof(workshop_field_tags[0]);
 
     for (int i = 0; i < len - 4; i++) {
@@ -330,18 +335,32 @@ static void PatchRecvBuffer(unsigned char* data, int len) {
             if (str_len <= 0 || str_len > 64) continue;
             if (len_pos + str_len > len) continue;
 
-            // Check if this string looks like a workshop code or identifier
+            // Sanity check: the string data must be >= 80% printable ASCII
+            // to avoid false positives from tag-like bytes in string payloads
             char* str_val = (char*)&data[len_pos];
-            bool is_workshop = false;
-            int scan_max = (str_len < 20) ? str_len : 20;
-            for (int s = 0; s < scan_max; s++) {
-                if (str_val[s] == '_' || str_val[s] == '-' || str_val[s] == ':') {
-                    is_workshop = true;
+            int printable = 0;
+            int check_count = (str_len < 20) ? str_len : 20;
+            for (int s = 0; s < check_count; s++) {
+                unsigned char c = (unsigned char)str_val[s];
+                if (c >= 0x20 && c < 0x7F) printable++;
+            }
+            bool is_plausible_string = (printable >= check_count * 9 / 10);
+
+            // If not printable, this was a false positive tag (data byte
+            // inside another field's payload). Don't skip — just continue.
+            if (!is_plausible_string) break;
+
+            // Workshop codes contain underscores (e.g. "ranked_asia_br",
+            // "gs_proxy_secret_val"). Colon excluded — too common in IPs.
+            bool has_underscore = false;
+            for (int s = 0; s < check_count; s++) {
+                if (str_val[s] == '_') {
+                    has_underscore = true;
                     break;
                 }
             }
 
-            if (is_workshop && str_len > 3) {
+            if (has_underscore && str_len > 3) {
                 // Replace with a custom marker: "cstm"
                 const char* custom_mark = "cstm";
                 int mark_len = 4;
@@ -353,11 +372,11 @@ static void PatchRecvBuffer(unsigned char* data, int len) {
                 for (int c = new_len; c < str_len && c < 8; c++) {
                     str_val[c] = 0x00;
                 }
-            }
 
-            // Skip past this string field
-            i = len_pos + str_len - 1;
-            break;
+                // Skip past this matched field
+                i = len_pos + str_len - 1;
+                break;
+            }
         }
     }
 
