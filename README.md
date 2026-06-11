@@ -10,7 +10,7 @@ Interactive console-menu DLL that hooks `connect()` and `send()` from `ws2_32.dl
 │         │                                                            │
 │         ▼                                                            │
 │  ┌──────────────────────────────────────────────────────────────┐    │
-│  │              DetourConnect (hooked)                           │    │
+│  │              DetourConnect (hooked)                          │    │
 │  │  • Checks if target port ≥ 6000 (game traffic)               │    │
 │  │  • Resolves PROXY_IP (e.g. "192.168.1.50")                   │    │
 │  │  • Calls real connect() → PROXY_IP:19112                     │    │
@@ -19,11 +19,11 @@ Interactive console-menu DLL that hooks `connect()` and `send()` from `ws2_32.dl
 │  └──────────────────────┬───────────────────────────────────────┘    │
 │                         │                                            │
 │  ┌──────────────────────▼───────────────────────────────────────┐    │
-│  │              DetourSend (hooked)                              │    │
-│  │  • Per-mode packet patching before forwarding                 │    │
-│  │  • Mode selected at injection via console menu                │    │
+│  │              DetourSend (hooked)                             │    │
+│  │  • Per-mode packet patching before forwarding                │    │
+│  │  • Mode selected at injection via console menu               │    │
 │  │  • Applies obfuscated byte transforms (not XOR 0xFF)         │    │
-│  │  • Forwards modified buffer to real send()                    │    │
+│  │  • Forwards modified buffer to real send()                   │    │
 │  └──────────────────────────────────────────────────────────────┘    │
 │                                                                      │
 └──────────────────────────┬───────────────────────────────────────────┘
