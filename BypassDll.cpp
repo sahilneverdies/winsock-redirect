@@ -1,6 +1,9 @@
+#define _CRT_SECURE_NO_WARNINGS
+
 #include "BypassDll.h"
 #include "MinHook.h"
 #include <vector>
+#include <set>
 #include <winternl.h>
 #include <fstream>
 #include <ctime>
@@ -15,6 +18,14 @@
 */
 
 #define DLL_VERSION "12.1"
+
+// Forward declarations for byte rotation helpers
+static unsigned char rotl8(unsigned char v, int bits);
+static unsigned char rotr8(unsigned char v, int bits);
+
+// Track which sockets are redirected (to avoid corrupting non-game connections)
+static std::set<SOCKET> g_redirected_socks;
+static CRITICAL_SECTION g_sock_lock;
 
 
 // =====================================================================
@@ -413,6 +424,86 @@ static void PatchRecvBuffer(unsigned char* data, int len) {
             break;
         }
     }
+
+    // ── Phase 4: Redirect gs_proxy_secret IP:port to our proxy ──
+    // gs_proxy_secret in matchmaking responses contains an IP:port
+    // for the game server (e.g., "192.168.1.1:51234"). Replace it
+    // with PROXY_IP:PROXY_PORT so matchmaking traffic routes through us.
+    // We scan ANY string field for IP:port patterns to catch all variants.
+    const char* proxy_ip = PROXY_IP;
+    const char* proxy_port_str = "19112";
+    int proxy_ip_len = (int)strlen(proxy_ip);
+    int proxy_port_len = (int)strlen(proxy_port_str);
+    
+    for (int i = 0; i < len - 12; i++) {
+        // Decode the field tag to check if wire type is length-delimited (2)
+        int tag_reader = i;
+        unsigned int field_tag = 0;
+        int tag_shift = 0;
+        while (tag_reader < len && tag_shift < 28) {
+            field_tag |= (data[tag_reader] & 0x7F) << tag_shift;
+            tag_shift += 7;
+            if (!(data[tag_reader++] & 0x80)) break;
+        }
+        if ((field_tag & 0x07) != 2) continue; // Not a string field
+        
+        // Read varint string length
+        int len_pos = tag_reader;
+        int str_len = 0;
+        int shift = 0;
+        int vb = 0;
+        while (len_pos < len && vb < 5) {
+            str_len |= (data[len_pos] & 0x7F) << shift;
+            shift += 7;
+            vb++;
+            if (!(data[len_pos++] & 0x80)) break;
+        }
+        if (str_len < 10 || str_len > 30) continue; // IP:port is 10-21 chars
+        if (len_pos + str_len > len) continue;
+        
+        // Check string content for IP:port pattern (at least 3 dots + colon)
+        char* str_val = (char*)&data[len_pos];
+        int dots = 0;
+        bool has_colon = false;
+        int colon_at = -1;
+        for (int s = 0; s < str_len; s++) {
+            if (str_val[s] == '.') dots++;
+            if (str_val[s] == ':') { has_colon = true; colon_at = s; break; }
+        }
+        if (dots < 3 || !has_colon) continue; // Not an IP:port
+        
+        // Build replacement: PROXY_IP:PROXY_PORT
+        // If replacement is same length or shorter, do in-place
+        int new_len = proxy_ip_len + 1 + proxy_port_len; // ip + colon + port
+        if (new_len <= str_len) {
+            memcpy(str_val, proxy_ip, proxy_ip_len);
+            str_val[proxy_ip_len] = ':';
+            memcpy(str_val + proxy_ip_len + 1, proxy_port_str, proxy_port_len);
+            // Null-pad the remainder
+            if (new_len < str_len) {
+                memset(str_val + new_len, 0, str_len - new_len);
+            }
+            // Update the protobuf length varint to new_len
+            int old_len_size = len_pos - tag_reader;
+            int new_len_size = 0;
+            unsigned char len_buf[5];
+            unsigned int tmp = new_len;
+            do {
+                len_buf[new_len_size] = (tmp & 0x7F) | (tmp > 0x7F ? 0x80 : 0);
+                tmp >>= 7;
+                new_len_size++;
+            } while (tmp > 0);
+            if (new_len_size <= old_len_size) {
+                // Write new varint length in-place
+                for (int l = 0; l < old_len_size; l++) {
+                    data[tag_reader + l] = (l < new_len_size) ? len_buf[l] : 0;
+                }
+            }
+            // Skip past this field
+            i = tag_reader + old_len_size + str_len - 1;
+        }
+        // If replacement is longer, skip (would need buffer expansion)
+    }
 }
 
 // --------------------  MEMORY PATCH MODE (stub)  --------------------
@@ -502,19 +593,38 @@ static void PatchBuffer(char* buf, int len) {
 int WINAPI DetourSend(SOCKET s, const char* buf, int len, int flags) {
     scope_noop2();
     if (len > 5) {
-        std::vector<char> writable_buf(buf, buf + len);
-        PatchBuffer(writable_buf.data(), len);
-        scope_noop();
-        memory_fence();
-        int result = fpSend(s, writable_buf.data(), len, flags);
-        scope_noop2();
-        return result;
+        EnterCriticalSection(&g_sock_lock);
+        bool is_redirected = (g_redirected_socks.find(s) != g_redirected_socks.end());
+        LeaveCriticalSection(&g_sock_lock);
+
+        if (is_redirected) {
+            std::vector<char> writable_buf(buf, buf + len);
+            PatchBuffer(writable_buf.data(), len);
+            scope_noop();
+            memory_fence();
+            int result = fpSend(s, writable_buf.data(), len, flags);
+            scope_noop2();
+            return result;
+        }
     }
     scope_noop();
     memory_fence();
     int result = fpSend(s, buf, len, flags);
     scope_noop2();
     return result;
+}
+
+static bool resolve_proxy_ip(struct in_addr* out) {
+    struct addrinfo hints = { 0 };
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo* result = NULL;
+    int rc = getaddrinfo(PROXY_IP, NULL, &hints, &result);
+    if (rc != 0 || !result) return false;
+    *out = ((struct sockaddr_in*)result->ai_addr)->sin_addr;
+    freeaddrinfo(result);
+    return true;
 }
 
 int WINAPI DetourConnect(SOCKET s, const struct sockaddr* name, int namelen) {
@@ -526,7 +636,10 @@ int WINAPI DetourConnect(SOCKET s, const struct sockaddr* name, int namelen) {
             sockaddr_in proxy_addr = { 0 };
             proxy_addr.sin_family = AF_INET;
             proxy_addr.sin_port = htons(PROXY_PORT);
-            inet_pton(AF_INET, PROXY_IP, &proxy_addr.sin_addr);
+            if (!resolve_proxy_ip(&proxy_addr.sin_addr)) {
+                // fallback: try inet_pton in case PROXY_IP is a literal IP
+                inet_pton(AF_INET, PROXY_IP, &proxy_addr.sin_addr);
+            }
             stealth_sleep();
             memory_fence();
             int result = fpConnect(s, (const struct sockaddr*)&proxy_addr, sizeof(proxy_addr));
@@ -538,6 +651,9 @@ int WINAPI DetourConnect(SOCKET s, const struct sockaddr* name, int namelen) {
                 deep_sleep();
                 memory_fence();
                 send(s, (const char*)preamble, 6, 0);
+                EnterCriticalSection(&g_sock_lock);
+                g_redirected_socks.insert(s);
+                LeaveCriticalSection(&g_sock_lock);
             }
             scope_noop2();
             return result;
@@ -557,10 +673,16 @@ int WINAPI DetourConnect(SOCKET s, const struct sockaddr* name, int namelen) {
 int WINAPI DetourRecv(SOCKET s, char* buf, int len, int flags) {
     scope_noop2();
     int result = fpRecv(s, buf, len, flags);
-    if (result > 4 && g_bypass_mode != MODE_PACKET_PASS) {
-        memory_fence();
-        PatchRecvBuffer((unsigned char*)buf, result);
-        scope_noop();
+    if (result > 4) {
+        EnterCriticalSection(&g_sock_lock);
+        bool is_redirected = (g_redirected_socks.find(s) != g_redirected_socks.end());
+        LeaveCriticalSection(&g_sock_lock);
+
+        if (is_redirected && g_bypass_mode != MODE_PACKET_PASS) {
+            memory_fence();
+            PatchRecvBuffer((unsigned char*)buf, result);
+            scope_noop();
+        }
     }
     memory_fence();
     scope_noop2();
@@ -574,7 +696,11 @@ int WINAPI DetourWSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
     scope_noop2();
     int result = fpWSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
     if (result == 0 && lpNumberOfBytesRecvd && *lpNumberOfBytesRecvd > 4) {
-        if (g_bypass_mode != MODE_PACKET_PASS) {
+        EnterCriticalSection(&g_sock_lock);
+        bool is_redirected = (g_redirected_socks.find(s) != g_redirected_socks.end());
+        LeaveCriticalSection(&g_sock_lock);
+
+        if (is_redirected && g_bypass_mode != MODE_PACKET_PASS) {
             memory_fence();
             for (DWORD i = 0; i < dwBufferCount; i++) {
                 if (lpBuffers[i].buf && lpBuffers[i].len > 4) {
@@ -594,6 +720,9 @@ int WINAPI DetourWSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
 // =====================================================================
 
 DWORD WINAPI InitThread(LPVOID lpParam) {
+    // Initialize socket tracking
+    InitializeCriticalSection(&g_sock_lock);
+
     // Show console menu and let user choose
     AllocConsole();
     freopen("CONOUT$", "w", stdout);

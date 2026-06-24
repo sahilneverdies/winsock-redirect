@@ -11,7 +11,7 @@
 #pragma comment(lib, "ws2_32.lib")
 
 // --- Configuration ---
-#define PROXY_IP "xenitronix"
+#define PROXY_IP "192.168.1.9"
 #define PROXY_PORT 19112
 
 // --- Function Prototypes ---
