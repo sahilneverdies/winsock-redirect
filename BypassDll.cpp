@@ -46,6 +46,12 @@ enum BYPASS_MODE {
 
 volatile int g_bypass_mode = MODE_RANKED_POOL;  // default
 
+// Packet capture mode
+static bool g_capture_active = false;
+static int g_capture_count = 0;
+static CRITICAL_SECTION g_capture_lock;
+#define CAPTURE_DIR "dll_captured"
+
 // =====================================================================
 //  HOOK FUNCTION TYPES
 // =====================================================================
@@ -130,6 +136,115 @@ static void obfuscate_preamble(unsigned char* preamble) {
 //  CONSOLE MENU
 // =====================================================================
 
+// ── ADB auto-injection for emulator property bypass ────────────────
+// Step 1: Push + run resetprop script (deletes 52+ emulator props via Magisk).
+// Step 2: If compiled libhooks.so + hooker exist, push + inject those too.
+static void AutoInjectHook() {
+    // Common BlueStacks ADB paths
+    const char* adb_paths[] = {
+        "C:\\Program Files\\BlueStacks_nxt\\adb.exe",
+        "C:\\Program Files\\BlueStacks\\adb.exe",
+        "C:\\ProgramData\\BlueStacks_nxt\\adb.exe",
+        "C:\\ProgramData\\BlueStacks\\adb.exe",
+        NULL
+    };
+
+    char adb[MAX_PATH] = { 0 };
+    char dll_dir[MAX_PATH] = { 0 };
+    GetModuleFileNameA(GetModuleHandle(NULL), dll_dir, MAX_PATH);
+    char* last_slash = strrchr(dll_dir, '\\');
+    if (last_slash) *last_slash = '\0';
+
+    for (int i = 0; adb_paths[i]; i++) {
+        if (GetFileAttributesA(adb_paths[i]) != INVALID_FILE_ATTRIBUTES) {
+            strcpy(adb, adb_paths[i]);
+            break;
+        }
+    }
+    if (!adb[0]) {
+        printf("  [!] adb.exe not found. Install BlueStacks or place adb.exe alongside DLL.\n");
+        return;
+    }
+
+    char cmd[2048];
+
+    // ── Step 1: Reset emulator properties via Magisk resetprop ──
+    // This deletes all 52+ ro.* emulator properties that libanogs checks.
+    // No compilation needed — works on any rooted BlueStacks with Magisk.
+    printf("  [1/2] Deleting emulator properties via resetprop...\n");
+    
+    // Build one long ADB shell command to delete all properties
+    const char* props[] = {
+        "ro.rk.screenshot_enable", "ro.rk.bt_enable", "ro.rk.ethernet_settings",
+        "ro.rk.flash_enable", "ro.rk.hdmi_enable", "ro.rksdk.version",
+        "ro.rk.display.device", "ro.rk.install.mount", "ro.rk.install.usb",
+        "ro.rk.system.build", "ro.cloud.gaming", "ro.vendor.platform",
+        "ro.boottime.cloudAppEngine", "ro.boot.qemu",
+        "ro.com.cph.vpn.changed", "ro.com.cph.cloud_app_engine",
+        "ro.com.cph.remote_input_method", "ro.com.cph.mac_address",
+        "ro.com.cph.sfs_enable", "ro.com.cph.non_root", "ro.com.cph.toast_enable",
+        "ro.com.cph.as.changed", "ro.com.cph.notification_disable",
+        "ro.com.cph.rootfs", "ro.com.cph.poweroff", "ro.com.cph.screenshot",
+        "ro.com.cph.vibrate", "ro.com.cph.gps", "ro.com.cph.wifi",
+        "ro.com.cph.bluetooth", "ro.com.cph.audio", "ro.com.cph.display",
+        "ro.com.cph.camera", "ro.com.cph.sensor", "ro.com.cph.battery",
+        "ro.com.cph.storage", "ro.com.cph.network", "ro.com.cph.thermal",
+        "ro.com.cph.usb",
+        "ro.dalvik.vm.native.bridge", "ro.enable.native.bridge.exec",
+        "ro.dalvik.vm.isa.arm64", "ro.dalvik.vm.isa.arm",
+        "ro.kernel.qemu", "ro.hardware.bochs", "ro.boottime.fb_ready",
+        "ro.product.cpu.abi2", "ro.build.description", "ro.build.display.id",
+        "ro.serialno", "ro.bootloader", "ro.bootmode",
+        NULL
+    };
+
+    // Build the shell command: delete all props in one su -c call
+    char prop_cmds[2048] = { 0 };
+    strcat(prop_cmds, "su -c \"");
+    for (int i = 0; props[i]; i++) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "resetprop -d '%s' 2>/dev/null; ", props[i]);
+        strcat(prop_cmds, buf);
+    }
+    strcat(prop_cmds, "echo done\"");
+    
+    snprintf(cmd, sizeof(cmd), "\"%s\" shell %s", adb, prop_cmds);
+    system(cmd);
+    printf("  [OK] Properties cleared.\n");
+
+    // ── Step 2: If compiled libhooks.so + hooker exist, inject those too ──
+    char libhooks_path[MAX_PATH];
+    char hooker_path[MAX_PATH];
+    snprintf(libhooks_path, MAX_PATH, "%s\\libhooks.so", dll_dir);
+    snprintf(hooker_path, MAX_PATH, "%s\\hooker", dll_dir);
+
+    if (GetFileAttributesA(libhooks_path) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesA(hooker_path) != INVALID_FILE_ATTRIBUTES) {
+        printf("  [2/2] libhooks.so found — injecting hook library...\n");
+
+        snprintf(cmd, sizeof(cmd), "\"%s\" push \"%s\" /data/local/tmp/libhooks.so", adb, libhooks_path);
+        system(cmd);
+
+        snprintf(cmd, sizeof(cmd), "\"%s\" push \"%s\" /data/local/tmp/hooker", adb, hooker_path);
+        system(cmd);
+
+        snprintf(cmd, sizeof(cmd), "\"%s\" shell su -c \"chmod 755 /data/local/tmp/hooker\"", adb);
+        system(cmd);
+
+        snprintf(cmd, sizeof(cmd),
+            "\"%s\" shell su -c \"/data/local/tmp/hooker com.dts.freefireth /data/local/tmp/libhooks.so\"",
+            adb);
+        system(cmd);
+
+        printf("  [OK] Hook library injected.\n");
+    } else {
+        printf("  [2/2] libhooks.so not found — resetprop only. "
+               "Compile from dll_src/libhooks/ with NDK for deeper hook.\n");
+    }
+
+    printf("  -> Emulator bypass prep complete. Launch Free Fire now.\n");
+}
+
 static void ShowMenu() {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
     CONSOLE_SCREEN_BUFFER_INFO csbi;
@@ -155,9 +270,16 @@ static void ShowMenu() {
     printf("   [6] Packet Pass-Through\n");
     printf("       - DLL only relays; mitmproxy does all mutation\n");
     printf("   [7] Aggressive (all methods combined)\n");
+    printf("   [8] Auto Bypass libanogs (ADB + resetprop)\n");
+    printf("       - Deletes 52 emulator properties via Magisk resetprop\n");
+    printf("       - Optionally injects libhooks.so hook if compiled\n");
+    printf("   [9] Packet Capture Mode\n");
+    printf("       - Dumps ALL send/recv payloads to 'dll_captured/' folder\n");
+    printf("       - PC logo bypass still active\n");
+    printf("       - No other modifications (pass-through to mitmproxy)\n");
     printf("\n");
     SetConsoleTextAttribute(hConsole, 14); // yellow
-    printf("   Select method (1-7): ");
+    printf("   Select method (1-9): ");
     SetConsoleTextAttribute(hConsole, 7);
 }
 
@@ -518,9 +640,134 @@ static void ApplyMemoryPatches() {
     // VirtualProtect((LPVOID)0xADDRESS, 4, old, &old);
 }
 
+// ── Protobuf field logger ───────────────────────────────────────────
+// Dumps unique field tags from every outbound protobuf to help
+// identify the in-game blacklist trigger pattern.
+// Enable by setting PROTO_LOG_FILE env var or uncomment below.
+
+#define PROTO_LOG_FILE "proto_fields.log"
+
+static std::set<int> g_logged_fields;
+static CRITICAL_SECTION g_log_lock;
+
+static void LogProtobufFields(unsigned char* data, int len, const char* direction) {
+    if (len < 3) return;
+    
+    // Simple protobuf field tag scanner — finds varint field tags
+    // Tags are varint-encoded: (field_number << 3) | wire_type
+    std::set<int> fields_found;
+    for (int i = 0; i < len - 1; i++) {
+        // Read varint tag
+        int tag = 0;
+        int shift = 0;
+        int pos = i;
+        while (pos < len && shift < 28) {
+            tag |= (data[pos] & 0x7F) << shift;
+            shift += 7;
+            if (!(data[pos++] & 0x80)) break;
+        }
+        if (tag == 0 || pos == i) continue;
+        
+        int field_num = tag >> 3;
+        int wire_type = tag & 0x07;
+        
+        if (field_num > 0 && field_num <= 200) {
+            fields_found.insert(field_num);
+            i = pos - 1; // advance past this tag
+        }
+    }
+    
+    if (fields_found.empty()) return;
+    
+    // Check for new fields
+    EnterCriticalSection(&g_log_lock);
+    bool has_new = false;
+    std::string new_fields;
+    for (int f : fields_found) {
+        if (g_logged_fields.find(f) == g_logged_fields.end()) {
+            g_logged_fields.insert(f);
+            has_new = true;
+            if (!new_fields.empty()) new_fields += ", ";
+            new_fields += std::to_string(f);
+        }
+    }
+    LeaveCriticalSection(&g_log_lock);
+    
+    if (has_new) {
+        // Log to file
+        FILE* fl = fopen(PROTO_LOG_FILE, "a");
+        if (fl) {
+            char ts[64];
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            sprintf(ts, "%02d:%02d:%02d.%03d", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+            fprintf(fl, "[%s] [%s] New fields: %s (total %zu unique)\n",
+                    ts, direction, new_fields.c_str(), g_logged_fields.size());
+            fclose(fl);
+        }
+        // Also print to console
+        printf("  [PROTO] [%s] New fields: %s (total %zu)\n",
+               direction, new_fields.c_str(), g_logged_fields.size());
+    }
+}
+
+// ── Packet capture dump (mode 9) ────────────────────────────────────
+// Saves raw send/recv payloads to dll_captured/ for blacklist analysis.
+static void DumpPacketCapture(const unsigned char* data, int len, const char* direction, const char* label) {
+    if (!g_capture_active || len < 4) return;
+
+    // Ensure capture directory exists
+    CreateDirectoryA(CAPTURE_DIR, NULL);
+
+    // Build timestamped filename
+    char fname[MAX_PATH];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(fname, MAX_PATH, "%s\\%04d%02d%02d_%02d%02d%02d_%03d_%s_%s.dat",
+             CAPTURE_DIR,
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+             direction, label);
+
+    FILE* fp = fopen(fname, "wb");
+    if (!fp) return;
+
+    // Write header
+    fprintf(fp, "# DLL Packet Capture\n");
+    fprintf(fp, "# Direction: %s\n", direction);
+    fprintf(fp, "# Label: %s\n", label);
+    fprintf(fp, "# Time: %04d-%02d-%02d %02d:%02d:%02d.%03d\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    fprintf(fp, "# Length: %d\n", len);
+    fprintf(fp, "# Hex:\n");
+
+    // Write hex dump
+    for (int i = 0; i < len; i++) {
+        fprintf(fp, "%02x", data[i]);
+        if ((i + 1) % 64 == 0) fprintf(fp, "\n");
+    }
+    if (len % 64 != 0) fprintf(fp, "\n");
+    fclose(fp);
+
+    EnterCriticalSection(&g_capture_lock);
+    g_capture_count++;
+    int count = g_capture_count;
+    LeaveCriticalSection(&g_capture_lock);
+
+    printf("  [CAPTURE] [%s] %s: %d bytes (total: %d)\n", direction, label, len, count);
+}
+
 // --------------------  MAIN PATCH DISPATCH  ---------------------------
 static void PatchBuffer(char* buf, int len) {
     unsigned char* data = (unsigned char*)buf;
+
+    // In capture mode, dump raw packet before any modification
+    if (g_capture_active) {
+        DumpPacketCapture(data, len, "SEND", "original");
+    }
+
+    // Log protobuf fields from every outbound packet
+    LogProtobufFields(data, len, "SEND");
 
     // Always strip PC/emulator detection flags regardless of mode
     PatchPcDetection(data, len);
@@ -674,14 +921,22 @@ int WINAPI DetourRecv(SOCKET s, char* buf, int len, int flags) {
     scope_noop2();
     int result = fpRecv(s, buf, len, flags);
     if (result > 4) {
+        // Log incoming protobuf fields
+        LogProtobufFields((unsigned char*)buf, result, "RECV");
+
         EnterCriticalSection(&g_sock_lock);
         bool is_redirected = (g_redirected_socks.find(s) != g_redirected_socks.end());
         LeaveCriticalSection(&g_sock_lock);
 
-        if (is_redirected && g_bypass_mode != MODE_PACKET_PASS) {
-            memory_fence();
-            PatchRecvBuffer((unsigned char*)buf, result);
-            scope_noop();
+        if (is_redirected) {
+            if (g_capture_active) {
+                DumpPacketCapture((unsigned char*)buf, result, "RECV", "original");
+            }
+            if (g_bypass_mode != MODE_PACKET_PASS) {
+                memory_fence();
+                PatchRecvBuffer((unsigned char*)buf, result);
+                scope_noop();
+            }
         }
     }
     memory_fence();
@@ -696,18 +951,38 @@ int WINAPI DetourWSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
     scope_noop2();
     int result = fpWSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
     if (result == 0 && lpNumberOfBytesRecvd && *lpNumberOfBytesRecvd > 4) {
+        // Log incoming protobuf fields (WSARecv variant)
+        for (DWORD i = 0; i < dwBufferCount; i++) {
+            if (lpBuffers[i].buf && lpBuffers[i].len > 4) {
+                LogProtobufFields((unsigned char*)lpBuffers[i].buf,
+                    lpBuffers[i].len > *lpNumberOfBytesRecvd ? *lpNumberOfBytesRecvd : lpBuffers[i].len,
+                    "RECV");
+            }
+        }
+
         EnterCriticalSection(&g_sock_lock);
         bool is_redirected = (g_redirected_socks.find(s) != g_redirected_socks.end());
         LeaveCriticalSection(&g_sock_lock);
 
-        if (is_redirected && g_bypass_mode != MODE_PACKET_PASS) {
-            memory_fence();
-            for (DWORD i = 0; i < dwBufferCount; i++) {
-                if (lpBuffers[i].buf && lpBuffers[i].len > 4) {
-                    PatchRecvBuffer((unsigned char*)lpBuffers[i].buf, lpBuffers[i].len > *lpNumberOfBytesRecvd ? *lpNumberOfBytesRecvd : lpBuffers[i].len);
+        if (is_redirected) {
+            if (g_capture_active) {
+                for (DWORD i = 0; i < dwBufferCount; i++) {
+                    if (lpBuffers[i].buf && lpBuffers[i].len > 4) {
+                        DumpPacketCapture((unsigned char*)lpBuffers[i].buf,
+                            lpBuffers[i].len > *lpNumberOfBytesRecvd ? *lpNumberOfBytesRecvd : lpBuffers[i].len,
+                            "RECV", "original");
+                    }
                 }
             }
-            scope_noop();
+            if (g_bypass_mode != MODE_PACKET_PASS) {
+                memory_fence();
+                for (DWORD i = 0; i < dwBufferCount; i++) {
+                    if (lpBuffers[i].buf && lpBuffers[i].len > 4) {
+                        PatchRecvBuffer((unsigned char*)lpBuffers[i].buf, lpBuffers[i].len > *lpNumberOfBytesRecvd ? *lpNumberOfBytesRecvd : lpBuffers[i].len);
+                    }
+                }
+                scope_noop();
+            }
         }
     }
     memory_fence();
@@ -722,6 +997,7 @@ int WINAPI DetourWSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount,
 DWORD WINAPI InitThread(LPVOID lpParam) {
     // Initialize socket tracking
     InitializeCriticalSection(&g_sock_lock);
+    InitializeCriticalSection(&g_log_lock);
 
     // Show console menu and let user choose
     AllocConsole();
@@ -734,11 +1010,25 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
     int selected = choice - '0';
     if (selected >= 1 && selected <= 7) {
         g_bypass_mode = selected;
+    } else if (selected == 8) {
+        g_bypass_mode = MODE_AGGRESSIVE; // Use aggressive patching + ADB hook
+        printf("\n  -> Selected: Method 8 (ADB Inject + Aggressive)\n");
+        printf("  -> Injecting libhooks.so into emulator...\n");
+        AutoInjectHook();
+    } else if (selected == 9) {
+        g_bypass_mode = MODE_PACKET_PASS; // Pass-through to mitmproxy, no modifications
+        g_capture_active = true;
+        InitializeCriticalSection(&g_capture_lock);
+        CreateDirectoryA(CAPTURE_DIR, NULL);
+        printf("\n  -> Selected: Method 9 (Packet Capture Mode)\n");
+        printf("  -> Dumping ALL send/recv payloads to '%s/'\n", CAPTURE_DIR);
+        printf("  -> PC logo bypass still active\n");
     } else {
         g_bypass_mode = MODE_RANKED_POOL; // fallback
     }
 
-    printf("\n  -> Selected: Method %d\n", g_bypass_mode);
+    printf("\n  -> Selected: Method %d%s\n", g_bypass_mode,
+           g_capture_active ? " (capture active)" : "");
     printf("  -> Hooks initializing...\n");
 
     // Apply memory patches immediately if selected
