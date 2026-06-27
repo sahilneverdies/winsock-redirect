@@ -713,18 +713,27 @@ static void LogProtobufFields(unsigned char* data, int len, const char* directio
 
 // ── Packet capture dump (mode 9) ────────────────────────────────────
 // Saves raw send/recv payloads to dll_captured/ for blacklist analysis.
+static char g_capture_dir[MAX_PATH] = { 0 };
+
 static void DumpPacketCapture(const unsigned char* data, int len, const char* direction, const char* label) {
     if (!g_capture_active || len < 4) return;
 
-    // Ensure capture directory exists
-    CreateDirectoryA(CAPTURE_DIR, NULL);
+    // Ensure capture directory exists (use DLL directory if set)
+    if (!g_capture_dir[0]) {
+        GetModuleFileNameA(GetModuleHandle(NULL), g_capture_dir, MAX_PATH);
+        char* last_slash = strrchr(g_capture_dir, '\\');
+        if (last_slash) *last_slash = '\0';
+        strcat(g_capture_dir, "\\");
+        strcat(g_capture_dir, CAPTURE_DIR);
+    }
+    CreateDirectoryA(g_capture_dir, NULL);
 
     // Build timestamped filename
     char fname[MAX_PATH];
     SYSTEMTIME st;
     GetLocalTime(&st);
     snprintf(fname, MAX_PATH, "%s\\%04d%02d%02d_%02d%02d%02d_%03d_%s_%s.dat",
-             CAPTURE_DIR,
+             g_capture_dir,
              st.wYear, st.wMonth, st.wDay,
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
              direction, label);
@@ -1019,9 +1028,15 @@ DWORD WINAPI InitThread(LPVOID lpParam) {
         g_bypass_mode = MODE_PACKET_PASS; // Pass-through to mitmproxy, no modifications
         g_capture_active = true;
         InitializeCriticalSection(&g_capture_lock);
-        CreateDirectoryA(CAPTURE_DIR, NULL);
+        // Resolve capture dir to DLL's directory
+        GetModuleFileNameA(GetModuleHandle(NULL), g_capture_dir, MAX_PATH);
+        char* last_slash = strrchr(g_capture_dir, '\\');
+        if (last_slash) *last_slash = '\0';
+        strcat(g_capture_dir, "\\");
+        strcat(g_capture_dir, CAPTURE_DIR);
+        CreateDirectoryA(g_capture_dir, NULL);
         printf("\n  -> Selected: Method 9 (Packet Capture Mode)\n");
-        printf("  -> Dumping ALL send/recv payloads to '%s/'\n", CAPTURE_DIR);
+        printf("  -> Dumping ALL send/recv payloads to: %s\n", g_capture_dir);
         printf("  -> PC logo bypass still active\n");
     } else {
         g_bypass_mode = MODE_RANKED_POOL; // fallback
