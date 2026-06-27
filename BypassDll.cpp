@@ -17,7 +17,7 @@
     - Useful for testing which approach works with current anti-cheat
 */
 
-#define DLL_VERSION "12.1"
+#define DLL_VERSION "12.2"
 
 // Forward declarations for byte rotation helpers
 static unsigned char rotl8(unsigned char v, int bits);
