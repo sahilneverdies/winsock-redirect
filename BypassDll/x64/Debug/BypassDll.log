@@ -1,0 +1,8 @@
+﻿  BypassDll.cpp
+  buffer.c
+  hook.c
+  trampoline.c
+  hde32.c
+  hde64.c
+  Generating Code...
+  BypassDll.vcxproj -> C:\Users\1nOnlySahil\Downloads\leakrd\UPDATED BYPASS WORKING FIXED\dll_src\x64\Debug\tcpdll.dll
